@@ -18,6 +18,7 @@ import (
 	http "github.com/Danny-Dasilva/fhttp"
 	"github.com/gorilla/websocket"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/proxy"
 )
 
 // Time wraps time.Time overriddin the json marshal/unmarshal to pass
@@ -89,6 +90,19 @@ type Options struct {
 
 	// Connection reuse options
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
+
+	// Dialer, when set, makes every TCP connection of the request — names are
+	// resolved by it too, as it receives host:port — instead of a direct dial
+	// from this process. Go callers only: it cannot travel as JSON. HTTP/3 and
+	// WebSocket requests do not go through it and are refused, and so is
+	// Proxy alongside it: reaching the proxy is the dialer's job then. Do
+	// returns such a refusal as an error; through Queue it ends the process,
+	// as Queue's other client errors do.
+	Dialer proxy.ContextDialer `json:"-"`
+	// DialerKey identifies Dialer in the client pool, which is process-wide:
+	// requests with different keys never share a client or its connections.
+	// Requests with a Dialer and no key are never pooled.
+	DialerKey string `json:"-"`
 }
 
 type cycleTLSRequest struct {
@@ -156,6 +170,9 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 
 		// Header ordering
 		HeaderOrder: request.Options.HeaderOrder,
+
+		dialer:    request.Options.Dialer,
+		dialerKey: request.Options.DialerKey,
 	}
 
 	// Handle protocol-specific clients
@@ -321,6 +338,9 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 
 		// Header ordering
 		HeaderOrder: request.Options.HeaderOrder,
+
+		dialer:    request.Options.Dialer,
+		dialerKey: request.Options.DialerKey,
 	}
 
 	// Default to true for connection reuse
@@ -409,6 +429,9 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 
 		// Header ordering
 		HeaderOrder: request.Options.HeaderOrder,
+
+		dialer:    request.Options.Dialer,
+		dialerKey: request.Options.DialerKey,
 	}
 
 	// Default to true for connection reuse
@@ -484,6 +507,9 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 
 		// Header ordering
 		HeaderOrder: request.Options.HeaderOrder,
+
+		dialer:    request.Options.Dialer,
+		dialerKey: request.Options.DialerKey,
 	}
 
 	// Get TLS config for WebSocket
@@ -999,8 +1025,11 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		activeRequestsMutex.Unlock()
 	}()
 
-	// Connect to WebSocket endpoint
-	conn, resp, err := res.wsClient.Connect(res.options.Options.URL)
+	// Connect to WebSocket endpoint. Its own dialer would bypass Options.Dialer.
+	conn, resp, err := (*websocket.Conn)(nil), (*nhttp.Response)(nil), errWebSocketDialer
+	if res.options.Options.Dialer == nil {
+		conn, resp, err = res.wsClient.Connect(res.options.Options.URL)
+	}
 	if err != nil {
 		// Send error response
 		var b bytes.Buffer
@@ -1388,6 +1417,8 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		ForceHTTP1:         options.ForceHTTP1,
 		ForceHTTP3:         options.ForceHTTP3,
 		HeaderOrder:        options.HeaderOrder,
+		dialer:             options.Dialer,
+		dialerKey:          options.DialerKey,
 	}
 
 	// Note: Don't automatically set HeaderOrder from UserAgent here as it can interfere with connection management
@@ -1411,6 +1442,14 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	)
 	if err != nil {
 		return Response{}, err
+	}
+
+	// With reuse off this client is not in the pool and serves only this
+	// request, so nothing else can be using its connections once we return.
+	// Close them here: the caller asked for a fresh connection per request, and
+	// a discarded client with no one left to close it just strands sockets.
+	if !enableConnectionReuse {
+		defer closeClientConnections(httpClient.Transport)
 	}
 
 	// Create request using fhttp
