@@ -26,6 +26,9 @@ type ClientPoolEntry struct {
 	Client    fhttp.Client
 	CreatedAt time.Time
 	LastUsed  time.Time
+	// DialerKey is the Options.DialerKey the client was built with, for
+	// CloseDialer.
+	DialerKey string
 }
 
 // Global client pool with metadata
@@ -248,6 +251,7 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 		Client:    client,
 		CreatedAt: now,
 		LastUsed:  now,
+		DialerKey: browser.dialerKey,
 	}
 
 	return client, nil
@@ -285,6 +289,32 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 	}
 
 	return clientBuilder(browser, dialer, timeout, disableRedirect), nil
+}
+
+// CloseDialer removes every client built with Options.DialerKey key from the
+// process-wide pool, and closes the idle connections they hold; a request in
+// flight on one finishes on it. Other dialers' clients are untouched.
+//
+// It is for a caller whose dialer is going away: its pooled connections were
+// made by that dialer — through a network namespace, say — and would keep
+// what they hold open, and be reused by a later dialer given the same key.
+func CloseDialer(key string) {
+	if key == "" {
+		return
+	}
+	advancedClientPoolMutex.Lock()
+	var closing []fhttp.Client
+	for k, entry := range advancedClientPool {
+		if entry.DialerKey == key {
+			closing = append(closing, entry.Client)
+			delete(advancedClientPool, k)
+		}
+	}
+	advancedClientPoolMutex.Unlock()
+
+	for _, c := range closing {
+		closeClientConnections(c.Transport)
+	}
 }
 
 // cleanupClientPool removes old unused clients from the pool
