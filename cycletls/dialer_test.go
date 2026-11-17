@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // recordingDialer dials target whatever address it is asked for, and records
@@ -176,5 +177,65 @@ func TestResponseErrCarriesTheDialerError(t *testing.T) {
 	resp, err = Init().Do(srv.URL, Options{EnableConnectionReuse: false}, "GET")
 	if err != nil || resp.Status != 200 || resp.Err != nil {
 		t.Fatalf("answered request: err %v, status %d, Response.Err %v", err, resp.Status, resp.Err)
+	}
+}
+
+// CloseDialer drops one dialer's pooled clients and closes their
+// connections; another dialer's stay, and are reused.
+func TestCloseDialerClosesOnlyItsOwnConnections(t *testing.T) {
+	var mu sync.Mutex
+	closed := 0
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			mu.Lock()
+			closed++
+			mu.Unlock()
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	c := Init()
+	defer c.Close()
+
+	do := func(d *recordingDialer, key string) {
+		t.Helper()
+		resp, err := c.Do("http://pooled.invalid/", Options{
+			Dialer:                d,
+			DialerKey:             key,
+			EnableConnectionReuse: true,
+			Timeout:               10,
+		}, "GET")
+		if err != nil || resp.Status != 200 {
+			t.Fatalf("Do: %v (status %d)", err, resp.Status)
+		}
+	}
+	a := &recordingDialer{target: srv.Listener.Addr().String()}
+	b := &recordingDialer{target: srv.Listener.Addr().String()}
+	do(a, "close-a")
+	do(b, "close-b")
+
+	CloseDialer("close-a")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := closed
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if n > 1 || time.Now().After(deadline) {
+			t.Fatalf("%d connections closed, want close-a's one", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	do(a, "close-a")
+	if n := len(a.dials()); n != 2 {
+		t.Errorf("close-a dialled %d times, want a new connection after CloseDialer", n)
+	}
+	do(b, "close-b")
+	if n := len(b.dials()); n != 1 {
+		t.Errorf("close-b dialled %d times, want its pooled connection kept", n)
 	}
 }
