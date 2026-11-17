@@ -93,9 +93,11 @@ type Options struct {
 
 	// Dialer, when set, makes every TCP connection of the request — names are
 	// resolved by it too, as it receives host:port — instead of a direct dial
-	// from this process. Go callers only (Do, Queue): it cannot travel as JSON.
-	// HTTP/3 and WebSocket requests do not go through it and are refused, and
-	// so is Proxy alongside it: reaching the proxy is the dialer's job then.
+	// from this process. Go callers only: it cannot travel as JSON. HTTP/3 and
+	// WebSocket requests do not go through it and are refused, and so is
+	// Proxy alongside it: reaching the proxy is the dialer's job then. Do
+	// returns such a refusal as an error; through Queue it ends the process,
+	// as Queue's other client errors do.
 	Dialer proxy.ContextDialer `json:"-"`
 	// DialerKey identifies Dialer in the client pool, which is process-wide:
 	// requests with different keys never share a client or its connections.
