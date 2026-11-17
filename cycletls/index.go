@@ -1354,6 +1354,13 @@ type Response struct {
 	Headers   map[string]string `json:"headers"`
 	Cookies   []*nhttp.Cookie   `json:"cookies"`
 	FinalUrl  string            `json:"finalUrl"`
+	// Err is why the request got no response, when it got none. Do then
+	// still returns a nil error and a Response, as it always has, with a
+	// Status guessed from the error's text (0 when there is no guess) and
+	// the text as Body; Err is the error itself, for callers that need to
+	// tell a failure from an answer, or one failure from another (errors.As
+	// reaches what a Dialer returned).
+	Err error `json:"-"`
 }
 
 // JSONBody parses the response body as JSON
@@ -1485,6 +1492,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		return Response{
 			Status: parsedError.StatusCode,
 			Body:   parsedError.ErrorMsg + " -> " + err.Error(),
+			Err:    err,
 		}, nil
 	}
 	defer resp.Body.Close()
