@@ -3,6 +3,7 @@ package cycletls
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	fhttp "github.com/Danny-Dasilva/fhttp"
 	"sync"
@@ -63,7 +64,18 @@ type Browser struct {
 
 	// HTTP client
 	client *fhttp.Client
+
+	// dialer makes the client's connections instead of a direct dial
+	// (Options.Dialer); dialerKey tells dialers apart in the client pool.
+	dialer    proxy.ContextDialer
+	dialerKey string
 }
+
+var (
+	errDialerWithProxy = errors.New("cycletls: Options.Dialer and Options.Proxy cannot both be set")
+	errDialerHTTP3     = errors.New("cycletls: HTTP/3 does not go through Options.Dialer")
+	errWebSocketDialer = errors.New("cycletls: WebSocket does not go through Options.Dialer")
+)
 
 // Protocol represents the HTTP protocol version
 type Protocol string
@@ -165,7 +177,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 	}
 
 	// Create a hash of the configuration that affects connection behavior
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|dialer:%q|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
 		browser.JA3,
 		browser.JA4r,
 		browser.HTTP2Fingerprint,
@@ -173,6 +185,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 		browser.UserAgent,
 		browser.ServerName,
 		proxyURL,
+		browser.dialerKey,
 		timeout,
 		disableRedirect,
 		browser.InsecureSkipVerify,
@@ -188,8 +201,10 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
 func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, proxyURL ...string) (fhttp.Client, error) {
-	// If connection reuse is disabled, always create a new client
-	if !enableConnectionReuse {
+	// If connection reuse is disabled, always create a new client. So is it
+	// for a dialer the pool cannot tell from another: sharing a client would
+	// send one caller's requests through another's dialer.
+	if !enableConnectionReuse || (browser.dialer != nil && browser.dialerKey == "") {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 	}
 
@@ -241,7 +256,22 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 // createNewClient creates a new HTTP client (internal function)
 func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (fhttp.Client, error) {
 	var dialer proxy.ContextDialer
-	if len(proxyURL) > 0 && len(proxyURL[0]) > 0 {
+	if browser.dialer != nil {
+		var err error
+		switch {
+		case len(proxyURL) > 0 && len(proxyURL[0]) > 0:
+			err = errDialerWithProxy
+		case browser.ForceHTTP3:
+			err = errDialerHTTP3
+		}
+		if err != nil {
+			return fhttp.Client{
+				Timeout:       time.Duration(timeout) * time.Second,
+				CheckRedirect: disabledRedirect,
+			}, err
+		}
+		dialer = browser.dialer
+	} else if len(proxyURL) > 0 && len(proxyURL[0]) > 0 {
 		var err error
 		dialer, err = newConnectDialer(proxyURL[0], userAgent)
 		if err != nil {
