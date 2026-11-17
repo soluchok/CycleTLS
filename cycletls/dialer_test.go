@@ -33,6 +33,13 @@ func (d *recordingDialer) dials() []string {
 	return append([]string(nil), d.addrs...)
 }
 
+// failingDialer fails every dial with err.
+type failingDialer struct{ err error }
+
+func (d failingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, d.err
+}
+
 func newDialerTestServer(t *testing.T, tlsServer bool) *httptest.Server {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok " + r.Host)) })
 	var srv *httptest.Server
@@ -150,5 +157,24 @@ func TestDialerRefusesWhatBypassesIt(t *testing.T) {
 	}
 	if got := d.dials(); len(got) != 0 {
 		t.Fatalf("dialer used for a refused request: %v", got)
+	}
+}
+
+// A request whose Dialer fails gets no response, and Response.Err says why:
+// the Dialer's own error, which the guessed Status cannot carry.
+func TestResponseErrCarriesTheDialerError(t *testing.T) {
+	refused := errors.New("refused by the dialer")
+	resp, err := Init().Do("http://site.invalid/", Options{Dialer: failingDialer{refused}, DialerKey: "k", EnableConnectionReuse: false}, "GET")
+	if err != nil {
+		t.Fatalf("Do: %v, want the failure in the Response as before", err)
+	}
+	if !errors.Is(resp.Err, refused) {
+		t.Fatalf("Response.Err = %v, want the dialer's error", resp.Err)
+	}
+
+	srv := newDialerTestServer(t, false)
+	resp, err = Init().Do(srv.URL, Options{EnableConnectionReuse: false}, "GET")
+	if err != nil || resp.Status != 200 || resp.Err != nil {
+		t.Fatalf("answered request: err %v, status %d, Response.Err %v", err, resp.Status, resp.Err)
 	}
 }
